@@ -15,7 +15,7 @@ var ENV = (typeof process !== "undefined" && process.env) || {};
 var CONFIG_FILE = ENV.TVBOT_CONFIG || "/home/owner/share/tvbot-config.json";
 var TV_HOST = ENV.TVBOT_TV_HOST || "127.0.0.1";
 var HTTP_PORT = Number(ENV.TVBOT_PORT || 8095);
-var VERSION = "0.1.0";
+var VERSION = "0.1.1";
 
 var state = { started: new Date().toISOString(), lastPoll: null, lastError: null, botName: null, logs: [], timer: null };
 
@@ -189,8 +189,9 @@ function handle(msg) {
 
 var offset = 0;
 var polling = false;
+var stopped = false;
 function poll() {
-  if (polling) return;
+  if (polling || stopped) return;
   if (!readConfig().botToken) { setTimeout(poll, 5000); return; }
   polling = true;
   tg("getUpdates", { offset: offset, timeout: 50, allowed_updates: ["message"] }, 65000, function (err, updates) {
@@ -251,8 +252,13 @@ http.createServer(function (req, res) {
     return;
   }
   send(404, { error: "not found" });
-}).on("error", function (e) { log("http: " + e.message); }).listen(HTTP_PORT);
-
-log("service " + VERSION + " started (tv " + TV_HOST + ", config " + CONFIG_FILE + ")");
-hello();
-poll();
+}).on("error", function (e) {
+  // TizenBrew may start the service twice (autolaunch + opening the app): only the instance that owns the
+  // port runs the bot, a second poller would make Telegram reject both ("Conflict: terminated by other getUpdates")
+  if (e.code === "EADDRINUSE") { stopped = true; try { console.log("[tvbot] another instance is running, this one stays idle"); } catch (x) { /* no console */ } return; }
+  log("http: " + e.message);
+}).listen(HTTP_PORT, function () {
+  log("service " + VERSION + " started (tv " + TV_HOST + ", config " + CONFIG_FILE + ")");
+  hello();
+  poll();
+});
