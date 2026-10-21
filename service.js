@@ -17,7 +17,7 @@ var ENV = (typeof process !== "undefined" && process.env) || {};
 var CONFIG_FILE = ENV.TVBOT_CONFIG || "/home/owner/share/tvbot-config.json";
 var TV_HOST = ENV.TVBOT_TV_HOST || "127.0.0.1";
 var HTTP_PORT = Number(ENV.TVBOT_PORT || 8095);
-var VERSION = "0.1.4";
+var VERSION = "0.1.5";
 var CODE_URL = "https://cdn.jsdelivr.net/gh/xuantruong1911/tv-telegram-bot@main/service.js";
 
 var state = { started: new Date().toISOString(), lastPoll: null, lastError: null, botName: null, logs: [], timer: null };
@@ -96,7 +96,52 @@ function nextKey() {
 }
 // opts (all optional, for trying connection variants from /testkey): port 8001 (plain ws) | 8002 (wss),
 // name (client name shown in the TV's Allow prompt), noToken.
+// The TV refuses remote-control connections made to 127.0.0.1 from an app on the TV itself (prompt, then
+// ms.channel.timeOut, 2026-10-22). So keys go to the TV LAN address, read from its own :8001 API.
+var lanIp = null;
+function tvHost(opts) { return (opts && opts.host) || readConfig().tvHost || lanIp || TV_HOST; }
+function detectLan() {
+  if (TV_HOST !== "127.0.0.1") return;
+  http.get("http://127.0.0.1:8001/api/v2/", function (r) {
+    var cs = [];
+    r.on("data", function (c) { cs.push(c); });
+    r.on("end", function () {
+      try { lanIp = JSON.parse(Buffer.concat(cs).toString("utf8")).device.ip || null; } catch (e) { /* keep null */ }
+      log("tv LAN address: " + (lanIp || "unknown"));
+    });
+  }).on("error", function (e) { log("tv LAN address: " + e.message); });
+}
+
+// UPnP RenderingControl (:9197) - mute / volume with no Allow prompt.
+function upnp(action, args, cb) {
+  var inner = "<InstanceID>0</InstanceID>" + Object.keys(args).map(function (k) { return "<" + k + ">" + args[k] + "</" + k + ">"; }).join("");
+  var body = '<?xml version="1.0" encoding="utf-8"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>' +
+    '<u:' + action + ' xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">' + inner + '</u:' + action + '></s:Body></s:Envelope>';
+  var req = http.request({ host: tvHost(), port: 9197, path: "/upnp/control/RenderingControl1", method: "POST",
+    headers: { "Content-Type": 'text/xml; charset="utf-8"', "SOAPAction": '"urn:schemas-upnp-org:service:RenderingControl:1#' + action + '"', "Content-Length": Buffer.byteLength(body) } }, function (res) {
+    var cs = [];
+    res.on("data", function (c) { cs.push(c); });
+    res.on("end", function () {
+      var x = Buffer.concat(cs).toString("utf8");
+      if (res.statusCode !== 200) return cb(new Error("UPnP " + action + " " + res.statusCode));
+      var m = /<Current(?:Mute|Volume)>(\d+)</.exec(x);
+      cb(null, m ? Number(m[1]) : null);
+    });
+  });
+  req.setTimeout(8000, function () { req.abort(); });
+  req.on("error", function (e) { cb(e); });
+  req.end(body);
+}
+function changeVolume(delta, cb) {
+  upnp("GetVolume", { Channel: "Master" }, function (err, v) {
+    if (err) return cb(err);
+    var nv = Math.max(0, Math.min(100, (v || 0) + delta));
+    upnp("SetVolume", { Channel: "Master", DesiredVolume: nv }, function (e2) { cb(e2, nv); });
+  });
+}
+
 function sendKeyNow(key, cb, opts) {
+  var TV_HOST = tvHost(opts); // eslint-disable-line no-shadow
   opts = opts || {};
   var cfg = readConfig();
   var port = Number(opts.port || cfg.tvPort || 8002);
@@ -177,7 +222,7 @@ function reply(chatId, text) {
   tg("sendMessage", { chat_id: chatId, text: text }, 15000, function (err) { if (err) log("send failed: " + err.message); });
 }
 
-var HELP = "Lệnh:\n/tat - tắt tivi ngay\n/tatsau 30 - tắt sau 30 phút\n/huy - huỷ hẹn giờ\n/trangthai - tivi có đang bật không\n/tieng - bật/tắt tiếng\n/to /nho - tăng/giảm âm lượng";
+var HELP = "Lệnh:\n/tat - tắt tivi ngay\n/tatsau 30 - tắt sau 30 phút\n/huy - huỷ hẹn giờ\n/trangthai - tivi có đang bật không\n/tieng - bật/tắt tiếng\n/to /nho - tăng/giảm âm lượng (/to 10 = tăng 10)\n/am 20 - đặt âm lượng";
 
 function powerOff(chatId, why) {
   sendKey("KEY_POWER", function (err) {
@@ -213,8 +258,21 @@ function handle(msg) {
     var left = state.timer ? " Hẹn tắt sau " + Math.ceil((state.timer.at - Date.now()) / 60000) + " phút." : "";
     return reply(chatId, "Tivi đang bật (bot chạy trên tivi từ " + state.started.slice(11, 16) + " UTC)." + left);
   }
-  var keys = { "/tieng": "KEY_MUTE", "/to": "KEY_VOLUP", "/nho": "KEY_VOLDOWN" };
-  if (keys[cmd]) return sendKey(keys[cmd], function (err) { reply(chatId, err ? "Lỗi: " + err.message : "OK"); });
+  if (cmd === "/tieng") {
+    return upnp("GetMute", { Channel: "Master" }, function (err, m) {
+      if (err) return reply(chatId, "Lỗi: " + err.message);
+      upnp("SetMute", { Channel: "Master", DesiredMute: m ? 0 : 1 }, function (e2) { reply(chatId, e2 ? "Lỗi: " + e2.message : (m ? "Đã bật tiếng." : "Đã tắt tiếng.")); });
+    });
+  }
+  if (cmd === "/to" || cmd === "/nho") {
+    var step = Number(arg) > 0 ? Number(arg) : 3;
+    return changeVolume(cmd === "/to" ? step : -step, function (err, nv) { reply(chatId, err ? "Lỗi: " + err.message : "Âm lượng: " + nv); });
+  }
+  if (cmd === "/am") {
+    var vol = Number(arg);
+    if (arg === undefined || !(vol >= 0 && vol <= 100)) return reply(chatId, "Ví dụ: /am 20 (0 - 100)");
+    return upnp("SetVolume", { Channel: "Master", DesiredVolume: vol }, function (err) { reply(chatId, err ? "Lỗi: " + err.message : "Âm lượng: " + vol); });
+  }
   reply(chatId, HELP);
 }
 
@@ -264,7 +322,7 @@ var server = http.createServer(function (req, res) {
   if (req.method === "GET" && url.indexOf("/testkey") === 0) {
     if (!cfg.adminKey || q.adminKey !== cfg.adminKey) return send(403, { error: "adminKey" });
     // direct call (not queued) so connection variants can be tried: &port=8001 &name=... &notoken=1
-    return sendKeyNow(q.key === "connect" ? null : q.key || null, function (err) { send(err ? 500 : 200, err ? { error: err.message } : { ok: true }); }, { port: q.port, name: q.name, noToken: q.notoken === "1" });
+    return sendKeyNow(q.key === "connect" ? null : q.key || null, function (err) { send(err ? 500 : 200, err ? { error: err.message } : { ok: true }); }, { port: q.port, name: q.name, host: q.host, noToken: q.notoken === "1" });
   }
   if (req.method === "POST" && url.indexOf("/config") === 0) {
     var body = "";
@@ -275,7 +333,7 @@ var server = http.createServer(function (req, res) {
       if (cfg.adminKey && j.adminKey !== cfg.adminKey) return send(403, { error: "adminKey" });
       if (!j.adminKey || String(j.adminKey).length < 16) return send(400, { error: "adminKey (16+ chars) required" });
       var c = readConfig();
-      ["botToken", "chatId", "announce", "tvToken", "tvPort", "tvName"].forEach(function (k) { if (j[k] !== undefined) c[k] = j[k]; });
+      ["botToken", "chatId", "announce", "tvToken", "tvPort", "tvName", "tvHost"].forEach(function (k) { if (j[k] !== undefined) c[k] = j[k]; });
       c.adminKey = j.adminKey;
       writeConfig(c);
       log("config updated");
@@ -321,6 +379,7 @@ var server = http.createServer(function (req, res) {
   log("http: " + e.message);
 }).listen(HTTP_PORT, function () {
   log("service " + VERSION + " started (tv " + TV_HOST + ", config " + CONFIG_FILE + ")");
+  detectLan();
   hello();
   poll();
 });
