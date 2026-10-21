@@ -9,13 +9,16 @@ var fs = require("fs");
 var http = require("http");
 var https = require("https");
 var tls = require("tls");
+var net = require("net");
+var vm = require("vm");
 var crypto = require("crypto");
 
 var ENV = (typeof process !== "undefined" && process.env) || {};
 var CONFIG_FILE = ENV.TVBOT_CONFIG || "/home/owner/share/tvbot-config.json";
 var TV_HOST = ENV.TVBOT_TV_HOST || "127.0.0.1";
 var HTTP_PORT = Number(ENV.TVBOT_PORT || 8095);
-var VERSION = "0.1.2";
+var VERSION = "0.1.4";
+var CODE_URL = "https://cdn.jsdelivr.net/gh/xuantruong1911/tv-telegram-bot@main/service.js";
 
 var state = { started: new Date().toISOString(), lastPoll: null, lastError: null, botName: null, logs: [], timer: null };
 
@@ -91,19 +94,25 @@ function nextKey() {
     nextKey();
   });
 }
-function sendKeyNow(key, cb) {
+// opts (all optional, for trying connection variants from /testkey): port 8001 (plain ws) | 8002 (wss),
+// name (client name shown in the TV's Allow prompt), noToken.
+function sendKeyNow(key, cb, opts) {
+  opts = opts || {};
   var cfg = readConfig();
-  var name = toBuf("TV Telegram Bot", "utf8").toString("base64");
-  var path = "/api/v2/channels/samsung.remote.control?name=" + encodeURIComponent(name) + (cfg.tvToken ? "&token=" + encodeURIComponent(cfg.tvToken) : "");
+  var port = Number(opts.port || cfg.tvPort || 8002);
+  var useToken = !opts.noToken && !!cfg.tvToken && port === 8002;
+  var name = toBuf(opts.name || cfg.tvName || "TV Telegram Bot", "utf8").toString("base64");
+  var path = "/api/v2/channels/samsung.remote.control?name=" + encodeURIComponent(name) + (useToken ? "&token=" + encodeURIComponent(cfg.tvToken) : "");
   var done = false;
   function finish(err) { if (done) return; done = true; clearTimeout(t); try { sock.end(); } catch (e) { /* closed */ } cb(err || null); }
   var t = setTimeout(function () { finish(new Error("TV did not answer within 60 s")); }, 60000);
-  log("tv: connecting" + (cfg.tvToken ? " with token" : " without token (TV will ask Allow)"));
-  var sock = tls.connect({ host: TV_HOST, port: 8002, rejectUnauthorized: false }, function () {
+  log("tv: connecting :" + port + (useToken ? " with token" : " without token"));
+  function hello() {
     var key64 = crypto.randomBytes(16).toString("base64");
-    sock.write("GET " + path + " HTTP/1.1\r\nHost: " + TV_HOST + ":8002\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+    sock.write("GET " + path + " HTTP/1.1\r\nHost: " + TV_HOST + ":" + port + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
       "Sec-WebSocket-Key: " + key64 + "\r\nSec-WebSocket-Version: 13\r\n\r\n");
-  });
+  }
+  var sock = port === 8002 ? tls.connect({ host: TV_HOST, port: port, rejectUnauthorized: false }, hello) : net.connect({ host: TV_HOST, port: port }, hello);
   var buf = toBuf([]);
   var upgraded = false;
   sock.on("data", function (chunk) {
@@ -129,6 +138,8 @@ function sendKeyNow(key, cb) {
         if (key === null) return finish(null); // connect test only
         sock.write(wsFrame(JSON.stringify({ method: "ms.remote.control", params: { Cmd: "Click", DataOfCmd: key, Option: "false", TypeOfRemote: "SendRemoteKey" } })));
         setTimeout(function () { finish(null); }, 400);
+      } else if (msg.event === "ms.channel.timeOut") {
+        finish(new Error("TV answered timeOut (the Allow was not given for this connection)"));
       } else if (msg.event === "ms.channel.unauthorized") {
         finish(new Error("TV refused: press Allow on the TV when it asks"));
       }
@@ -158,6 +169,7 @@ function tg(method, params, timeoutMs, cb) {
   });
   req.setTimeout(timeoutMs, function () { req.abort(); });
   req.on("error", function (e) { cb(e); });
+  if (method === "getUpdates") pollReq = req;
   req.end(body);
 }
 
@@ -206,6 +218,7 @@ function handle(msg) {
   reply(chatId, HELP);
 }
 
+var pollReq = null;
 var offset = 0;
 var polling = false;
 var stopped = false;
@@ -239,7 +252,7 @@ function hello() {
 // ── LAN config / status endpoint ───────────────────────────────────────────────────────────
 // GET /status -> JSON. POST /config {botToken, chatId, adminKey}: the first write sets adminKey;
 // later writes must send the same adminKey. GET /testkey?key=KEY_MUTE needs ?adminKey= too.
-http.createServer(function (req, res) {
+var server = http.createServer(function (req, res) {
   function send(code, obj) { res.writeHead(code, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }); res.end(JSON.stringify(obj)); }
   var url = req.url || "/";
   var cfg = readConfig();
@@ -250,7 +263,8 @@ http.createServer(function (req, res) {
   (url.split("?")[1] || "").split("&").forEach(function (p) { var kv = p.split("="); if (kv[0]) q[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || ""); });
   if (req.method === "GET" && url.indexOf("/testkey") === 0) {
     if (!cfg.adminKey || q.adminKey !== cfg.adminKey) return send(403, { error: "adminKey" });
-    return sendKey(q.key === "connect" ? null : q.key || null, function (err) { send(err ? 500 : 200, err ? { error: err.message } : { ok: true }); });
+    // direct call (not queued) so connection variants can be tried: &port=8001 &name=... &notoken=1
+    return sendKeyNow(q.key === "connect" ? null : q.key || null, function (err) { send(err ? 500 : 200, err ? { error: err.message } : { ok: true }); }, { port: q.port, name: q.name, noToken: q.notoken === "1" });
   }
   if (req.method === "POST" && url.indexOf("/config") === 0) {
     var body = "";
@@ -261,7 +275,7 @@ http.createServer(function (req, res) {
       if (cfg.adminKey && j.adminKey !== cfg.adminKey) return send(403, { error: "adminKey" });
       if (!j.adminKey || String(j.adminKey).length < 16) return send(400, { error: "adminKey (16+ chars) required" });
       var c = readConfig();
-      ["botToken", "chatId", "announce", "tvToken"].forEach(function (k) { if (j[k] !== undefined) c[k] = j[k]; });
+      ["botToken", "chatId", "announce", "tvToken", "tvPort", "tvName"].forEach(function (k) { if (j[k] !== undefined) c[k] = j[k]; });
       c.adminKey = j.adminKey;
       writeConfig(c);
       log("config updated");
@@ -270,11 +284,40 @@ http.createServer(function (req, res) {
     });
     return;
   }
+  // POST /reload {adminKey}: fetch the latest service.js from jsDelivr and run it in place of this one,
+  // so an update needs no TV restart (purge the jsDelivr cache first).
+  if (req.method === "POST" && url.indexOf("/reload") === 0) {
+    var rb = "";
+    req.on("data", function (c) { rb += c; });
+    req.on("end", function () {
+      var rj = {};
+      try { rj = JSON.parse(rb || "{}"); } catch (e) { /* empty */ }
+      if (!cfg.adminKey || rj.adminKey !== cfg.adminKey) return send(403, { error: "adminKey" });
+      https.get(CODE_URL + "?t=" + Date.now(), function (r2) {
+        var cs = [];
+        r2.on("data", function (c) { cs.push(c); });
+        r2.on("end", function () {
+          var code = Buffer.concat(cs).toString("utf8");
+          if (r2.statusCode !== 200 || code.indexOf("TV Telegram Bot") < 0) return send(502, { error: "download failed (" + r2.statusCode + ")" });
+          send(200, { ok: true, from: VERSION });
+          stopped = true;
+          if (pollReq) { try { pollReq.abort(); } catch (e) { /* done */ } }
+          if (state.timer) clearTimeout(state.timer.t);
+          server.close(function () {
+            var tz = typeof tizen !== "undefined" ? tizen : undefined; // eslint-disable-line no-undef
+            var box = { require: require, process: process, Buffer: Buffer, console: console, setTimeout: setTimeout, clearTimeout: clearTimeout, setInterval: setInterval, clearInterval: clearInterval, module: { exports: {} }, tizen: tz };
+            try { vm.runInNewContext(code, box); } catch (e) { try { console.log("[tvbot] reload failed: " + e.message); } catch (x) { /* no console */ } }
+          });
+        });
+      }).on("error", function (e) { send(502, { error: e.message }); });
+    });
+    return;
+  }
   send(404, { error: "not found" });
 }).on("error", function (e) {
   // TizenBrew may start the service twice (autolaunch + opening the app): only the instance that owns the
   // port runs the bot, a second poller would make Telegram reject both ("Conflict: terminated by other getUpdates")
-  if (e.code === "EADDRINUSE") { stopped = true; try { console.log("[tvbot] another instance is running, this one stays idle"); } catch (x) { /* no console */ } return; }
+  if (e.code === "EADDRINUSE") { stopped = true; server = null; try { console.log("[tvbot] another instance is running, this one stays idle"); } catch (x) { /* no console */ } return; }
   log("http: " + e.message);
 }).listen(HTTP_PORT, function () {
   log("service " + VERSION + " started (tv " + TV_HOST + ", config " + CONFIG_FILE + ")");
