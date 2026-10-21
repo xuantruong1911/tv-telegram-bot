@@ -1,0 +1,11 @@
+{
+  "name": "tv-telegram-bot",
+  "version": "0.1.0",
+  "description": "Telegram bot that runs on a Samsung Tizen TV (TizenBrew service): turn the TV off, sleep timer, volume.",
+  "packageType": "app",
+  "appName": "TV Telegram Bot",
+  "appPath": "app/index.html",
+  "serviceFile": "service.js",
+  "keys": [],
+  "license": "MIT"
+}

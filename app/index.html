@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>TV Telegram Bot</title>
+<style>
+  body { margin: 0; background: #0f172a; color: #e2e8f0; font: 28px/1.5 sans-serif; padding: 60px 90px; }
+  h1 { font-size: 48px; margin: 0 0 24px; }
+  .ok { color: #4ade80; } .bad { color: #f87171; }
+  pre { font-size: 20px; background: #1e293b; padding: 20px; border-radius: 12px; max-height: 520px; overflow: hidden; white-space: pre-wrap; }
+  .hint { color: #94a3b8; font-size: 24px; }
+</style>
+</head>
+<body>
+<h1>TV Telegram Bot</h1>
+<div id="s">Đang kiểm tra dịch vụ...</div>
+<pre id="l"></pre>
+<div class="hint">Bấm Back (Quay lại) để thoát. Bot vẫn chạy nền khi đã bật trong Autolaunch Settings for services.</div>
+<script>
+  function esc(t) { return String(t).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+  function refresh() {
+    var x = new XMLHttpRequest();
+    x.open("GET", "http://127.0.0.1:8095/status");
+    x.timeout = 3000;
+    x.onload = function () {
+      var j = JSON.parse(x.responseText);
+      var lines = [
+        "Dịch vụ: <span class='ok'>đang chạy</span> (v" + esc(j.version) + ")",
+        "Cấu hình: " + (j.configured ? "<span class='ok'>đã có</span>" : "<span class='bad'>chưa có</span>"),
+        "Bot: " + (j.bot ? "@" + esc(j.bot) : "-"),
+        "Telegram: " + (j.lastError ? "<span class='bad'>" + esc(j.lastError) + "</span>" : (j.lastPoll ? "<span class='ok'>kết nối tốt</span>" : "-")),
+        "Quyền điều khiển tivi: " + (j.tvToken ? "<span class='ok'>đã cho phép</span>" : "chưa (lần đầu tivi sẽ hỏi Allow)")
+      ];
+      document.getElementById("s").innerHTML = lines.join("<br>");
+      document.getElementById("l").textContent = (j.logs || []).slice(-15).join("\n");
+    };
+    x.onerror = x.ontimeout = function () {
+      document.getElementById("s").innerHTML = "<span class='bad'>Dịch vụ chưa chạy.</span> Vào TizenBrew > Settings > Autolaunch Settings for services, chọn TV Telegram Bot, rồi mở lại TizenBrew.";
+    };
+    x.send();
+  }
+  refresh();
+  setInterval(refresh, 3000);
+  document.addEventListener("keydown", function (e) {
+    if (e.keyCode === 10009 || e.keyCode === 8) { try { tizen.application.getCurrentApplication().exit(); } catch (err) { history.back(); } }
+  });
+</script>
+</body>
+</html>
