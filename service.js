@@ -15,7 +15,7 @@ var ENV = (typeof process !== "undefined" && process.env) || {};
 var CONFIG_FILE = ENV.TVBOT_CONFIG || "/home/owner/share/tvbot-config.json";
 var TV_HOST = ENV.TVBOT_TV_HOST || "127.0.0.1";
 var HTTP_PORT = Number(ENV.TVBOT_PORT || 8095);
-var VERSION = "0.1.1";
+var VERSION = "0.1.2";
 
 var state = { started: new Date().toISOString(), lastPoll: null, lastError: null, botName: null, logs: [], timer: null };
 
@@ -75,13 +75,30 @@ function wsParse(buf) {
 
 /** Sends one remote key (KEY_POWER, KEY_MUTE...) to the TV. cb(err). The first time the TV shows an
  *  "Allow" prompt; the token it returns is saved so later connections need no prompt. */
+var keyQueue = [];
+var keyBusy = false;
 function sendKey(key, cb) {
+  keyQueue.push({ key: key, cb: cb });
+  if (!keyBusy) nextKey();
+}
+function nextKey() {
+  var job = keyQueue.shift();
+  if (!job) { keyBusy = false; return; }
+  keyBusy = true;
+  sendKeyNow(job.key, function (err) {
+    if (err) { var q = keyQueue; keyQueue = []; q.forEach(function (j) { j.cb(err); }); } // do not trigger a new prompt per queued tap
+    job.cb(err);
+    nextKey();
+  });
+}
+function sendKeyNow(key, cb) {
   var cfg = readConfig();
   var name = toBuf("TV Telegram Bot", "utf8").toString("base64");
   var path = "/api/v2/channels/samsung.remote.control?name=" + encodeURIComponent(name) + (cfg.tvToken ? "&token=" + encodeURIComponent(cfg.tvToken) : "");
   var done = false;
   function finish(err) { if (done) return; done = true; clearTimeout(t); try { sock.end(); } catch (e) { /* closed */ } cb(err || null); }
-  var t = setTimeout(function () { finish(new Error("TV did not answer (no Allow on the TV screen?)")); }, 30000);
+  var t = setTimeout(function () { finish(new Error("TV did not answer within 60 s")); }, 60000);
+  log("tv: connecting" + (cfg.tvToken ? " with token" : " without token (TV will ask Allow)"));
   var sock = tls.connect({ host: TV_HOST, port: 8002, rejectUnauthorized: false }, function () {
     var key64 = crypto.randomBytes(16).toString("base64");
     sock.write("GET " + path + " HTTP/1.1\r\nHost: " + TV_HOST + ":8002\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
@@ -95,6 +112,7 @@ function sendKey(key, cb) {
       var end = buf.toString("binary").indexOf("\r\n\r\n");
       if (end < 0) return;
       var head = buf.slice(0, end).toString("utf8");
+      log("tv: " + head.split("\r\n")[0]);
       if (head.indexOf(" 101 ") < 0) return finish(new Error("handshake refused: " + head.split("\r\n")[0]));
       upgraded = true;
       buf = buf.slice(end + 4);
@@ -103,7 +121,8 @@ function sendKey(key, cb) {
     buf = r.rest;
     r.messages.forEach(function (m) {
       var msg;
-      try { msg = JSON.parse(m); } catch (e) { return; }
+      try { msg = JSON.parse(m); } catch (e) { log("tv: non-JSON " + m.slice(0, 80)); return; }
+      log("tv: event " + msg.event);
       if (msg.event === "ms.channel.connect") {
         var tok = msg.data && msg.data.token;
         if (tok && tok !== cfg.tvToken) { var c = readConfig(); c.tvToken = tok; writeConfig(c); log("TV token saved"); }
@@ -116,7 +135,7 @@ function sendKey(key, cb) {
     });
   });
   sock.on("error", function (e) { finish(e); });
-  sock.on("close", function () { finish(done ? null : new Error("TV closed the connection")); });
+  sock.on("close", function () { if (!done) log("tv: connection closed, " + buf.length + " bytes unread"); finish(done ? null : new Error("TV closed the connection")); });
 }
 
 // ── Telegram ───────────────────────────────────────────────────────────────────────────────
@@ -242,7 +261,7 @@ http.createServer(function (req, res) {
       if (cfg.adminKey && j.adminKey !== cfg.adminKey) return send(403, { error: "adminKey" });
       if (!j.adminKey || String(j.adminKey).length < 16) return send(400, { error: "adminKey (16+ chars) required" });
       var c = readConfig();
-      ["botToken", "chatId", "announce"].forEach(function (k) { if (j[k] !== undefined) c[k] = j[k]; });
+      ["botToken", "chatId", "announce", "tvToken"].forEach(function (k) { if (j[k] !== undefined) c[k] = j[k]; });
       c.adminKey = j.adminKey;
       writeConfig(c);
       log("config updated");
